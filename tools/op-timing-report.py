@@ -1,14 +1,10 @@
 #!/usr/bin/env python3
-"""Aggregate an ``op-timing`` trace into a per-operation compile-time report.
+"""Aggregate an op-timing trace into a per-operation compile-time report.
 
-The file format is specified in ``docs/trace-format.md`` (schema ``op-timing``,
-version 1) and is a subset of Chrome Trace Event: pairs of ``B``/``E`` events,
-each carrying the action tag and, on the opening event, the identity of the
-operation the action ran on (``op`` / ``sym`` / ``loc``) plus structured
-``pass`` / ``arg`` fields.  Any collector that emits those fields can be read
-here; nothing about MLIR is assumed.  Chrome Trace stores no durations, no self time
-and no call counts, so all three are derived here by pairing the events per
-thread, and the result is written as one aggregate JSON document.
+Input format: docs/trace-format.md (schema ``op-timing``, version 1).  Nothing
+about MLIR is assumed — any collector emitting those fields can be read here.
+Chrome Trace stores no durations, self time or call counts, so all three are
+derived by pairing events per thread and written as one aggregate document.
 
 Usage:
     op-timing-report.py trace.json                  # writes trace.report.json
@@ -16,15 +12,7 @@ Usage:
     op-timing-report.py trace.json --table           # also print the tables
     op-timing-report.py trace.json --baseline base.json  # compare, exit 1 on regression
 
-The output JSON is the artifact to keep: ``wall_ms`` for the whole compile,
-``per_operation`` for the IR view and ``per_scope`` for the pass / pattern
-view, one row per key with ``count`` / ``self`` / ``incl`` / ``worst`` in
-microseconds.  Times are microseconds; divide by 1000 for milliseconds.
-
-``outside`` (per pass) is the time between the end of a pass action and the
-next event on the same thread.  In an MLIR host that interval is the after-pass
-verifier plus analysis invalidation, so verifier cost is measured without
-disabling verification; see docs/trace-format.md section 5.
+Field definitions: docs/usage.md.  Reading the numbers: docs/measurement.md.
 """
 
 import bisect
@@ -68,10 +56,8 @@ def load(path):
 def scope_name(event):
     """Human name of a trace scope.
 
-    Prefers the structured ``args.pass`` field, which every collector following
-    docs/trace-format.md is expected to fill in.  Falls back to the free-form
-    ``args.desc`` text printed by upstream ``Action::print()``, so traces from an
-    older collector keep working.
+    Structured ``args.pass`` first (see docs/trace-format.md), free-form
+    ``args.desc`` as a fallback so older traces keep working.
     """
     name = event["name"]
     args = event.get("args", {})
@@ -147,15 +133,10 @@ def pair(events):
 def framework_time(records, events):
     """Time spent outside every action span, attributed to the pass that ended.
 
-    Everything between the end of one action and the start of the next is work
-    the action layer cannot see: the after-pass verifier (`mlir::verify` at
-    `mlir/lib/Pass/Pass.cpp:557`) and analysis invalidation (`:534`).  A pass's
-    `self` time therefore never contains it, while the enclosing pipeline
-    adaptor's span does.  Measuring it needs no flag and no instrumentation:
-    it is the gap between the `E` of a `pass-execution` action and the next
-    event on the same thread.
-
-    Returns (per scope x pass name, total in us).
+    Taken as the gap between the ``E`` of a pass action and the next event on
+    the same thread; in an MLIR host that gap is the after-pass verifier plus
+    analysis invalidation (docs/measurement.md).  Returns (per scope, total) in
+    microseconds.
     """
     trace_ts = defaultdict(list)
     for event in events:

@@ -1,14 +1,9 @@
-# Op-level compile-time collection for MLIR-based compilers: header-only
-# collector plus a Python aggregation script.  This directory is
-# self-contained and can be copied out of this repository.
+# Header-only collector plus a Python aggregation script; self-contained, so
+# this directory can be copied into another compiler repository.
 #
-# Embedded (as in this repository):
-#   add_subdirectory(op-timing)
-#   target_link_libraries(<your-tool> PRIVATE op-timing)
-#
-# Standalone:
-#   cmake -S op-timing -B build-op-timing -DMLIR_DIR=<mlir cmake dir>
-#   cmake --build build-op-timing
+# Embedded:    add_subdirectory(<path-to-op-timing>)  +  link target op-timing
+# Standalone:  cmake -S . -B <build> -DMLIR_DIR=<mlir cmake dir>
+# Docs:        README.md, docs/design.md, docs/usage.md
 
 cmake_minimum_required(VERSION 3.20)
 
@@ -26,15 +21,12 @@ add_library(optiming::op-timing ALIAS op-timing)
 target_include_directories(op-timing INTERFACE
   ${CMAKE_CURRENT_SOURCE_DIR}/include)
 
-# MLIRIR for MLIRContext / Action / Operation, MLIRSupport for the
-# instrumentation helpers.  Nothing else is required: the collector uses
-# public MLIR API only, so no patched LLVM checkout is needed.
+# Public MLIR API only, so no patched LLVM checkout is required.
 target_link_libraries(op-timing INTERFACE
   MLIRIR
   MLIRSupport)
 
 if(OP_TIMING_STANDALONE)
-  file(GLOB OP_TIMING_HEADERS ${CMAKE_CURRENT_SOURCE_DIR}/include/*.h)
   add_library(op-timing-syntax-check OBJECT
     ${CMAKE_CURRENT_SOURCE_DIR}/tests/syntax-check.cpp)
   target_link_libraries(op-timing-syntax-check PRIVATE op-timing)

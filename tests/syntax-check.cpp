@@ -1,5 +1,4 @@
-// Compiles the header on its own, so that a standalone configure proves the
-// collector needs nothing beyond public MLIR API.  Not linked into anything.
+// Compiled by a standalone configure to prove the header needs no host headers.
 #include "OpTimingProfiler.h"
 
 void optimingSyntaxCheck(mlir::MLIRContext &context) {
