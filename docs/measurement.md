@@ -1,41 +1,41 @@
-# 测量口径与参考数据
+# 度量口径与基准实验
 
-本文说明怎样读这些数字、哪些开关会改变它们，以及参考环境下的实测值。机制说明见 `design.md`。
-
----
-
-## 1. 口径
-
-### 1.1 验证器自动单列
-
-`--verify-each` 是上游 `mlir-opt` 的开关（默认 `true`），`mlir::verify` 在 `executeAction` **之后**执行（`mlir/lib/Pass/Pass.cpp:557`），因此它不进任何 action span，也就不可能出现在 `self` 里。但它必然落在 `pass-execution` 的 `E` 与同一线程下一个事件之间，**这个间隔就是它的时长**。报告脚本据此把验证器（外加 `am.invalidate`）算成每个 pass 的 `outside`。
-
-结论：**不需要开关，也不需要跑两遍**就能看到验证代价。
-
-### 1.2 两条读表规则
-
-1. pass 归因看 `self`，验证代价看 `outside`，两者不重叠。加 `--verify-each=false` 只是让 `outside` 归零、去掉最后一点噪声。
-2. 读 `<nested pipeline>` 这类 adaptor 行的 `self` 时，减去其子 pass 的 `outside` 之和——那部分是子 pass 的验证，被算进了 adaptor 的 span（见 2.3）。
-
-### 1.3 不要把 action 外的缺口当解析或打印
-
-`wall_ms - inside_actions_ms` 只包含**最外层可见**的验证器时间；解析、打印、context 初始化根本不在这份 trace 的跨度里。要看它们的代价用 `-mlir-timing`（见 2.2）。
-
-### 1.4 多线程下百分比不可加
-
-`wall` 是墙钟，`self` 之和是各线程 CPU 时间之和，比值可能超过 100%（实测 8 个函数并行 canonicalize 时为 767.5%）。需要可加数字时加 `-mlir-disable-threading`；此时 `outside` 也不再包含线程等待。
-
-### 1.5 别直接比毫秒数
-
-Debug + assertions 构建下重复运行的波动可达 ±20%。跨版本比较用比例与相对排名。
+本文档阐述 op-timing 各项指标的计算口径、相关编译开关对度量结果的影响机制，并提供标准基准环境下的实测数据与开销评估。
 
 ---
 
-## 2. 参考数据
+## 1. 度量口径与分析规范
 
-环境：Debug + assertions，16 核，单线程（trace 内 `threads: 1`）。输入为 MobileNetV2（155 个 ONNX 节点 → 1589 行 linalg-on-tensors，`m.mlir`，111 KB）；输出 15661 行 / 1.03 MB LLVM dialect；trace 14.48 MB / 45033 个 span / 2083 个不同 op 行 / 7153 个 scope×op 行 / 17 个 pass 行。
+### 1.1 框架验证开销的离线分离（`outside` 指标）
 
-pipeline：
+MLIR 上游驱动默认启用 `--verify-each` 机制。在 Pass 执行流程中，`mlir::verify` 与 `AnalysisManager::invalidate` 均在 `PassExecutionAction` 触发**之后**执行（`mlir/lib/Pass/Pass.cpp`）。因此，该验证逻辑不会进入任何 Action 的 Span 区间，亦不会被计入 Pass 的 `self` 自耗时。
+
+然而，验证逻辑必定位于当前 `pass-execution` 的结束事件（`E`）与同线程后续首个事件之间。后处理脚本通过计算该时间间隙，将验证与分析失效开销归因至对应的 Pass，记为 `outside` 指标。该机制使得用户无需多次执行编译或开关验证选项，即可在单次追踪中离线分离 IR 验证所占用的物理时间。
+
+### 1.2 指标解读与校准规范
+
+1. **Pass 执行耗时与验证开销正交隔离**：Pass 自身的改写与优化逻辑通过 `self` 反映，框架层面的 IR 验证与分析失效代价通过 `outside` 反映，两者在统计上严格正交。指定 `--verify-each=false` 参数将使 `outside` 趋近于零。
+2. **嵌套适配器（Adaptor）的自耗时校准**：对于 `<nested pipeline>` 这类代表 `OpToOpPassAdaptor` 的聚合行，其 Span 生命周期贯穿所有子 Pass 的执行。子 Pass 执行完毕后触发的验证逻辑位于该子 Pass 的 `E` 之后，但仍处于父级 Adaptor 的 Span 闭合之前，因此会被直接计入 Adaptor 的 `self`。校准 Adaptor 净调度耗时时，需减去其包含的所有子 Pass 的 `outside` 之和。
+
+### 1.3 时间线跨度与进程生命周期边界
+
+报告中 `wall_ms - inside_actions_ms` 仅反映最外层可见的 Pass 间隙耗时。IR 文本解析、目标代码格式化输出及上下文环境初始化均发生在该追踪时间线之前或之后。若需评估编译全周期的资源消耗，应结合 `-mlir-timing` 进行对照分析。
+
+### 1.4 并发执行下的统计可加性约束
+
+`wall_ms` 为物理墙钟时间，而各动作的 `self` 耗时为多线程 CPU 时间的累计和。在高度并发的编译场景下，`self` 累加值与 `wall_ms` 的比值可以超出 100%。当后处理脚本检测到多线程事件时将输出提示信息。若需严格满足百分比可加性，需配置 `-mlir-disable-threading` 单线程模式；在此模式下，`outside` 指标亦排除了线程调度与等待延迟的干扰。
+
+### 1.5 性能回归分析的基准度量原则
+
+在包含调试信息与断言校验（Debug + Assertions）的构建版本中，物理执行时间在多次运行间可能存在约 ±20% 的测量方差。在进行跨版本性能回归对比时，应优先比对耗时百分比分布与相对排序，而非绝对物理毫秒数。
+
+---
+
+## 2. 基准实验数据
+
+**测试环境**：16 核心平台，Debug + Assertions 构建，启用单线程模式（`threads: 1`）。输入模型为 MobileNetV2（155 个 ONNX 节点转换生成的 1589 行 Linalg-on-Tensors IR，文件大小 111 KB）；编译降级输出为 15661 行 / 1.03 MB 的 LLVM Dialect IR。追踪记录共包含 14.48 MB 原始数据、45033 个 Span 区间、2083 个独立 Operation 实例行、7153 个 Scope-Operation 组合行以及 17 个 Pass 阶段。
+
+编译管线配置：
 
 ```
 builtin.module(func.func(linalg-fuse-elementwise-ops),canonicalize,cse,inline,
@@ -46,154 +46,160 @@ builtin.module(func.func(linalg-fuse-elementwise-ops),canonicalize,cse,inline,
  convert-func-to-llvm,reconcile-unrealized-casts)
 ```
 
-### 2.1 验证器：43% 的墙钟
+### 2.1 框架验证开销分析
 
-同一份 trace，两种配置：
+对比验证机制启用与关闭时的全局时间分布：
 
-| 配置 | trace wall | action 内合计 | Σ outside | 其中落在 span 外 |
+| 配置模式 | 追踪墙钟耗时（`wall_ms`） | Action 累计耗时（`inside_actions_ms`） | 框架验证耗时（`Σ outside`） | 顶层可见间隙耗时 |
 | --- | --- | --- | --- | --- |
-| `--verify-each` 默认 | 1817.38 ms | 1111.24 ms | **778.85 ms（42.9%）** | 706.15 ms |
-| `--verify-each=false` | 1107.79 ms | 1107.23 ms | 6.21 ms（0.6%） | 0.56 ms |
+| 默认（启用 `--verify-each`） | 1817.38 ms | 1111.24 ms | **778.85 ms（42.9%）** | 706.15 ms |
+| 禁用（`--verify-each=false`） | 1107.79 ms | 1107.23 ms | 6.21 ms（0.6%） | 0.56 ms |
 
-`Σ outside` 是验证器总量；`wall - inside_actions` 只是最外层可见的那部分，差额 72.70 ms 发生在嵌套 adaptor 的 span 内部。因此要总量就用 `outside_actions_ms`，不能用缺口。
+`Σ outside` 代表验证逻辑的全局累计耗时；`wall_ms - inside_actions_ms` 仅反映最外层未被嵌套 Span 覆盖的部分，差额 72.70 ms 发生在嵌套 Adaptor 的 Span 内部。评估验证器开销时应以 `outside_actions_ms` 为准。
 
-验证器在 pass 之间的分布（`per_pass[].outside`，前 6）：
+框架验证在各 Pass 阶段的耗时分布（按 `outside` 降序排列，取前 6 项）：
 
-| outside ms | pass |
+| 验证耗时（`outside`） | Pass 名称 |
 | --- | --- |
-| 133.96 | `ConvertFuncToLLVMPass` |
-| 108.43 | `ConvertControlFlowToLLVMPass` |
-| 101.54 | `FinalizeMemRefToLLVMConversionPass` |
-| 84.75 | `Canonicalizer`（3 次合计） |
-| 47.55 | `ConvertAffineToStandard` |
-| 46.57 | `ConvertIndexToLLVMPass` |
+| 133.96 ms | `ConvertFuncToLLVMPass` |
+| 108.43 ms | `ConvertControlFlowToLLVMPass` |
+| 101.54 ms | `FinalizeMemRefToLLVMConversionPass` |
+| 84.75 ms | `Canonicalizer`（3 次执行累计） |
+| 47.55 ms | `ConvertAffineToStandard` |
+| 46.57 ms | `ConvertIndexToLLVMPass` |
 
-规律：**验证代价 ≈ 该 pass 结束时模块的规模**。`ConvertFuncToLLVMPass` 之后模块已是完整 LLVM dialect，验证最贵；`LinalgElementwiseOpFusionPass` 在链路最前，模块还是 linalg，只有 19.93 ms。
+数据表明：**Pass 执行后的验证耗时与其结束时 IR 模块的节点规模成正相关**。在管线末期的 `ConvertFuncToLLVMPass` 阶段，IR 已经完全展开为庞大的 LLVM Dialect，验证耗时达到峰值；而在管线初期的 `LinalgElementwiseOpFusionPass` 阶段，IR 规模较小，验证耗时仅为 19.93 ms。
 
-比值：变换 1111.24 ms，验证 778.85 ms —— 每 1 秒变换额外付 0.70 秒验证。这就是 pass 级归因必须先把它隔离出来的原因。
+在当前测试用例中，核心变换耗时 1111.24 ms，框架验证耗时 778.85 ms，验证开销占核心变换耗时的 70.1%。
 
-端到端墙钟（best of 5，均未开测量）：`--verify-each=false` 1280 ms，默认 2103 ms。
+进程端到端物理墙钟耗时（5 次运行取最优值）：默认模式为 2103 ms，禁用验证后为 1280 ms。
 
-### 2.2 进程预算（`--verify-each=false`，`-mlir-timing`）
+### 2.2 编译器生命周期预算分解
 
-| 阶段 | 时间 | 占比 |
+在禁用验证模式（`--verify-each=false`）下，结合 `-mlir-timing` 输出的进程全局耗时分解：
+
+| 执行阶段 | 耗时区间 | 全局占比 |
 | --- | --- | --- |
-| `Parser`（解析 111 KB / 1595 行） | 67–73 ms | 5.3–5.5% |
-| MLIR pass 与 pattern | 856–922 ms | 67.9–68.8% |
-| `Output`（打印 1 MB / 15661 行文本） | 333–343 ms | 25.5–26.4% |
-| `Rest` | 2–3 ms | 0.2% |
-| `Total` | 1.26–1.34 s | 100.0% |
+| `Parser`（文本解析 111 KB / 1595 行） | 67–73 ms | 5.3–5.5% |
+| MLIR Pass 与 Pattern 改写 | 856–922 ms | 67.9–68.8% |
+| `Output`（文本格式化输出 1 MB / 15661 行） | 333–343 ms | 25.5–26.4% |
+| `Rest`（其他框架开销） | 2–3 ms | 0.2% |
+| 全流程总计（`Total`） | 1.26–1.34 s | 100.0% |
 
-`Parser` 与 `Output` 是 driver 建立的合成 TimingScope（`mlir/lib/Tools/mlir-opt/MlirOptMain.cpp:382`、`:420`），`Output` 覆盖 `AsmState` 构造加 `op->print()`。加 `--emit-bytecode` 后 `Output` 从 333 ms 降到 **84 ms**、`Total` 从 1.26 s 降到 1.03 s —— 1 MB 文本的格式化成本约 250 ms，与 pass 无关。
+`Parser` 与 `Output` 是宿主驱动构造的计时作用域。其中 `Output` 涵盖 `AsmState` 构造与 `Operation::print()` 过程。当启用 `--emit-bytecode` 采用字节码输出时，`Output` 阶段耗时从 333 ms 下降至 **84 ms**，全流程总时间自 1.26 s 降至 1.03 s。
 
-注意：`-o /dev/null` **不会**跳过格式化，它只丢弃字节。要省掉这项只有 `--emit-bytecode` 或自写 driver 不打印。
+需要说明的是，重定向输出至 `/dev/null`（`-o /dev/null`）并不会跳过文本格式化逻辑，仅丢弃了写出字节。消除格式化开销必须显式启用 `--emit-bytecode` 或由宿主驱动跳过打印逻辑。
 
-### 2.3 嵌套 adaptor 的 `self` 修正
+### 2.3 嵌套适配器耗时校准验证
 
-嵌套 pass 的 `E` 之后紧接着验证，而 adaptor 的 span 要等所有子 pass 结束才关闭，所以这段验证被算进 adaptor 的 `self`。默认配置下 `pass: <nested pipeline>` 的 self 是 49.46 ms、关掉验证器后 0.16 ms；它两个子 pass 的 `outside` 是 19.93 + 29.41 = **49.34 ms**，与 49.30 ms 的差值吻合——该行的 `self` 完全由子 pass 的验证构成，与 pipeline 调度无关。
+嵌套 Pass 执行完毕后触发的验证逻辑位于该子 Pass 的 Span 外部，但仍处于父级 Adaptor 的 Span 闭合之前，因此该验证耗时会被直接计入 Adaptor 的 `self`。
 
-### 2.4 pass 与 op 归因（`--verify-each=false`，分母 = 该次 trace 跨度）
+基准测试中，在默认配置下 `pass: <nested pipeline>` 的 `self` 耗时为 49.46 ms；禁用验证器后该值下降至 0.16 ms。其包含的两个子 Pass 的 `outside` 耗时分别为 19.93 ms 与 29.41 ms，累计为 **49.34 ms**，与 49.30 ms 的差额高度吻合。这证明 Adaptor 行的 `self` 耗时主要由子 Pass 的验证开销构成，其自身的调度开销极低。
 
-| 花在哪 | self | 占比 |
+### 2.4 Pass 与 Operation 级耗时分解
+
+在禁用验证模式下，以追踪时间跨度为基准的耗时分布：
+
+| 耗时组成分类 | 自耗时（`self`） | 相对占比 |
 | --- | --- | --- |
-| 具体某次改写（落到单个 op） | 398.79 ms | 40.6% |
-| 重写驱动迭代（`greedy-iteration`） | 261.81 ms | 26.7% |
-| pass 自身逻辑 | 320.28 ms | 32.6% |
-| pipeline adaptor | 0.15 ms | 0.0% |
-| 合计（action 内） | 981.04 ms | 100.0% |
+| 具体改写动作（归因至具体 Operation 实例） | 398.79 ms | 40.6% |
+| 贪心重写驱动循环（`greedy-iteration`） | 261.81 ms | 26.7% |
+| Pass 固有执行逻辑 | 320.28 ms | 32.6% |
+| 管线适配器调度（Adaptor） | 0.15 ms | 0.0% |
+| Action 监控区间合计 | 981.04 ms | 100.0% |
 
-最慢 pass（self / incl）：
+Pass 级耗时排名（按 `self` 降序排列）：
 
-| 次数 | self ms | incl ms | pass |
+| 调用次数 | 自耗时（`self`） | 包含耗时（`incl`） | Pass 名称 |
 | --- | --- | --- | --- |
-| 8 | 261.81 | 475.31 | `greedy-iteration`（canonicalize / cse / inline 内部的驱动循环） |
-| 1 | 86.92 | 86.92 | `OneShotBufferize` |
-| 1 | 45.62 | 76.45 | `ConvertFuncToLLVMPass` |
-| 2 | 33.83 | 33.83 | `CSE` |
-| 1 | 33.50 | 67.43 | `ArithToLLVMConversionPass` |
-| 1 | 25.29 | 98.82 | `FinalizeMemRefToLLVMConversionPass` |
-| 1 | 16.21 | 210.59 | `ConvertLinalgToLoopsPass` |
-| 1 | 16.07 | 34.53 | `ConvertControlFlowToLLVMPass` |
-| 1 | 13.14 | 13.14 | `ConvertIndexToLLVMPass` |
-| 1 | 11.36 | 38.62 | `SCFToControlFlow` |
-| 1 | 10.44 | 23.71 | `Inliner` |
-| 1 | 9.89 | 11.17 | `ConvertAffineToStandard` |
-| 1 | 7.69 | 7.69 | `ReconcileUnrealizedCasts` |
-| 3 | 6.78 | 236.79 | `Canonicalizer` |
-| 1 | 2.22 | 53.13 | `LinalgElementwiseOpFusionPass` |
-| 1 | 1.34 | 1.34 | `LoopInvariantCodeMotion` |
-| 2 | 0.15 | 263.87 | `<nested pipeline>` |
+| 8 | 261.81 ms | 475.31 ms | `greedy-iteration`（Canonicalize / CSE / Inline 内部驱动循环） |
+| 1 | 86.92 ms | 86.92 ms | `OneShotBufferize` |
+| 1 | 45.62 ms | 76.45 ms | `ConvertFuncToLLVMPass` |
+| 2 | 33.83 ms | 33.83 ms | `CSE` |
+| 1 | 33.50 ms | 67.43 ms | `ArithToLLVMConversionPass` |
+| 1 | 25.29 ms | 98.82 ms | `FinalizeMemRefToLLVMConversionPass` |
+| 1 | 16.21 ms | 210.59 ms | `ConvertLinalgToLoopsPass` |
+| 1 | 16.07 ms | 34.53 ms | `ConvertControlFlowToLLVMPass` |
+| 1 | 13.14 ms | 13.14 ms | `ConvertIndexToLLVMPass` |
+| 1 | 11.36 ms | 38.62 ms | `SCFToControlFlow` |
+| 1 | 10.44 ms | 23.71 ms | `Inliner` |
+| 1 | 9.89 ms | 11.17 ms | `ConvertAffineToStandard` |
+| 1 | 7.69 ms | 7.69 ms | `ReconcileUnrealizedCasts` |
+| 3 | 6.78 ms | 236.79 ms | `Canonicalizer` |
+| 1 | 2.22 ms | 53.13 ms | `LinalgElementwiseOpFusionPass` |
+| 1 | 1.34 ms | 1.34 ms | `LoopInvariantCodeMotion` |
+| 2 | 0.15 ms | 263.87 ms | `<nested pipeline>` |
 
-`ConvertLinalgToLoopsPass` 这行是读表方法的例子：`self` 只有 16.21 ms，`incl` 达 210.59 ms —— 它自己几乎不花时间，时间花在它触发的 pattern 上。`OneShotBufferize` 相反：86.92 ms 全部是自己，因为它的分析不经过 pattern，没有 op 级事件可分。
+上述数据体现了 `self` 与 `incl` 指标的典型特征：`ConvertLinalgToLoopsPass` 的 `self` 耗时仅为 16.21 ms，但 `incl` 耗时高达 210.59 ms，表明其自身调度逻辑开销极小，绝大部分时间耗费在其触发的底层 Pattern 改写；与此相对，`OneShotBufferize` 的 `self` 与 `incl` 均为 86.92 ms，原因在于其接口遍历分析并不派发 Pattern 改写动作，全部归属于 Pass 自身内部开销。
 
-op 级（`per_operation`，只含改写类动作，前 6 行）：
+Operation 级耗时排名（`per_operation` 视图，仅包含改写类动作，展示前 6 项）：
 
-| 次数 | self ms | op | sym | loc |
+| 触发次数 | 自耗时（`self`） | Operation 类型 | 符号名（`sym`） | 源码位置（`loc`） |
 | --- | --- | --- | --- | --- |
-| 1 | 11.83 | `func.func` | `main` | `m.mlir:2:3` |
-| 432 | 2.55 | `arith.addf` | — | — |
-| 378 | 2.52 | `arith.mulf` | — | — |
-| 32 | 1.02 | `linalg.generic` | — | `m.mlir:1356:13` |
-| 32 | 1.00 | `linalg.generic` | — | `m.mlir:463:13` |
-| 32 | 1.00 | `linalg.generic` | — | `m.mlir:29:11` |
+| 1 | 11.83 ms | `func.func` | `main` | `m.mlir:2:3` |
+| 432 | 2.55 ms | `arith.addf` | — | — |
+| 378 | 2.52 ms | `arith.mulf` | — | — |
+| 32 | 1.02 ms | `linalg.generic` | — | `m.mlir:1356:13` |
+| 32 | 1.00 ms | `linalg.generic` | — | `m.mlir:463:13` |
+| 32 | 1.00 ms | `linalg.generic` | — | `m.mlir:29:11` |
 
-`arith.mulf` / `arith.addf` 没有 `loc`，是 fold 过程中临时构造的 op，本来就没有源位置；带 `loc` 的行全部指向具体源码行列，且同类 op 的不同实例（1356 行 vs 463 行）是分开的行。
+其中 `arith.mulf` 与 `arith.addf` 缺乏源位置（`loc` 为空），属于改写过程中动态折叠生成的临时中间节点；附带 `loc` 的记录均精确绑定至源文件行列号，相同类型的不同 Operation 实例（如第 1356 行与第 463 行的 `linalg.generic`）均被独立记录与聚合。
 
-### 2.5 测量开销
+### 2.5 观测开销（Profiling Overhead）评估
 
-| 配置 | 墙钟 | trace 大小 |
+| 运行配置 | 端到端物理墙钟 | 追踪文件体积 |
 | --- | --- | --- |
-| `OP_TIMING` 未设置，`--verify-each=false` | 1280 ms | — |
-| `OP_TIMING=<file>`，`--verify-each=false` | 1377 ms | 14.48 MB |
-| `OP_TIMING` 未设置，verify 默认 | 2103 ms | — |
-| `OP_TIMING=<file>`，verify 默认 | 2231 ms | 14.48 MB |
+| 未配置 `OP_TIMING`，禁用验证（`--verify-each=false`） | 1280 ms | — |
+| 启用 `OP_TIMING`，禁用验证（`--verify-each=false`） | 1377 ms | 14.48 MB |
+| 未配置 `OP_TIMING`，默认启用验证 | 2103 ms | — |
+| 启用 `OP_TIMING`，默认启用验证 | 2231 ms | 14.48 MB |
 
-开销 **+6~8%**，来源是 45033×2 条 JSON 事件行与每条一次加锁。上游 `--profile-actions-to` 在同输入下实测 +4~5%。
+在基准负载下，采集器引入的端到端耗时开销为 **+6% 至 +8%**。该开销主要来源于 45033 对开始与结束事件的 JSON 格式化与文件 I/O 锁争用。作为对比，MLIR 原生 `--profile-actions-to` 在相同测试用例下的观测开销约为 +4% 至 +5%。
 
-### 2.6 `outside` 的交叉验证
+### 2.6 `outside` 指标的一致性与交叉验证
 
-`outside` 是派生量，需要独立测量确认没有系统性偏差：
+为验证 `outside` 指标与物理真实开销的一致性，将其与独立进程墙钟耗时差值进行比对：
 
-| 量 | 含验证器 | 不含验证器 |
-| --- | --- | --- |
-| `Σ outside`（派生） | 778.85 ms | 6.21 ms |
-| 进程墙钟差（独立） | — | 823 ms |
+| 度量维度 | 启用验证配置 | 禁用验证配置 | 差值 |
+| --- | --- | --- | --- |
+| 追踪派生验证耗时（`Σ outside`） | 778.85 ms | 6.21 ms | 772.64 ms |
+| 进程级物理墙钟耗时（端到端） | 2103 ms | 1280 ms | 823.00 ms |
 
-两者差 44 ms（5.3%），来源有两个：**最后一次 pass 之后的验证**在最后一个 span 结束之后才执行，落在 trace 跨度之外，任何从 trace 派生的量都看不到；以及 Debug 构建的 run-to-run 波动。因此 `outside` 可以直接当验证器开销使用，只需记住它天然截断在最后一个 span。
+两者绝对偏差为 50.36 ms（相对偏差约 6.1%）。偏差原因主要包含两点：管线最后一个 Pass 执行完毕后触发的终态验证位于追踪时间线最后一个 Span 关闭之后，脱离了追踪记录跨度；此外，Debug 构建模式下的物理测量方差亦引入了一定波动。这验证了 `outside` 指标能够高度可靠地反映框架验证开销。
 
 ---
 
-## 3. 复现
+## 3. 实验复现流程
 
 ```bash
-B=<path-to-tool>
-P="$(cat pipeline.txt)"
-R=tools/op-timing-report.py
+TOOL_BIN=<path-to-tool>
+PIPELINE="$(cat pipeline.txt)"
+REPORT_SCRIPT=tools/op-timing-report.py
 
-# 1. 进程预算（Parser / Output / Rest / pass 合计）
-$B input.mlir -o /dev/null --pass-pipeline="$P" --verify-each=false -mlir-timing \
+# 1. 采集进程级生命周期预算（Parser / Output / Rest / Pass）
+$TOOL_BIN input.mlir -o /dev/null --pass-pipeline="$PIPELINE" --verify-each=false -mlir-timing \
   | grep -E "Total|Parser|Output|Rest"
 
-# 2. pass / op 归因（验证器自动单列在 outside 列）
-OP_TIMING=/tmp/t_on.json $B input.mlir -o /dev/null --pass-pipeline="$P"
-python3 $R /tmp/t_on.json --table --top 20
+# 2. 导出细粒度追踪并聚合生成报表（验证器开销独立归纳至 outside 列）
+OP_TIMING=/tmp/trace_verify_on.json $TOOL_BIN input.mlir -o /dev/null --pass-pipeline="$PIPELINE"
+python3 $REPORT_SCRIPT /tmp/trace_verify_on.json --table --top 20
 
-# 3. 交叉验证 outside 列（关掉验证器后应降到 1 ms 量级）
-OP_TIMING=/tmp/t_off.json $B input.mlir -o /dev/null --pass-pipeline="$P" \
+# 3. 交叉验证：禁用验证后重新采集，比对 outside 列降幅
+OP_TIMING=/tmp/trace_verify_off.json $TOOL_BIN input.mlir -o /dev/null --pass-pipeline="$PIPELINE" \
   --verify-each=false
-python3 $R /tmp/t_off.json
+python3 $REPORT_SCRIPT /tmp/trace_verify_off.json
 
-# 4. 测量开销：把 2 的 OP_TIMING 去掉，用 -mlir-timing 的 Total 做对比
+# 4. 观测开销评测：移除 OP_TIMING 环境变量，比对 -mlir-timing 的 Total 物理总时间
 ```
 
 ---
 
-## 4. 参考环境的附注
+## 4. 基准测试环境驱动配置说明
 
-上表的数字取自 MLIR-NorthStar 仓库的 `NS-opt15` driver，它原本只注册 NorthStar 自己的 pass，命令行不认 `one-shot-bufferize`、`convert-linalg-to-loops` 等标准 pass。为跑通完整降级链路，该 driver 补齐了：
+上述实验数据基于 MLIR-NorthStar 项目的 `NS-opt15` 驱动程序生成。为了执行完整的 Linalg-on-Tensors 至 LLVM Dialect 降级流程，测试驱动加载了以下核心依赖组件：
 
-- dialect：`scf::SCFDialect`、`LLVM::LLVMDialect`、`bufferization::BufferizationDialect`；
-- 外部模型：`tensor::registerInferTypeOpInterfaceExternalModels`（缺它 `tensor.collapse_shape` 会以 `ReifyRankedShapedTypeOpInterface ... never implemented` 直接 abort）；
-- pass 家族：`registerTransformsPasses` / `registerLinalgPasses` / `bufferization::registerBufferizationPasses` / `registerSCFPasses` / `memref::registerMemRefPasses`，加 8 个具体 conversion pass。
+- **Dialect 支持**：`scf::SCFDialect`、`LLVM::LLVMDialect` 以及 `bufferization::BufferizationDialect`；
+- **接口外部模型（External Model）**：`tensor::registerInferTypeOpInterfaceExternalModels`（确保 `tensor.collapse_shape` 等算子具备类型推导能力）；
+- **Pass 族注册**：`registerTransformsPasses`、`registerLinalgPasses`、`bufferization::registerBufferizationPasses`、`registerSCFPasses`、`memref::registerMemRefPasses` 及相关 Dialect 转换 Pass。
 
-这些属于"为测量而必需的 driver 能力补齐"，与测量本身可分离：任何已经能在命令行跑标准 pipeline 的 driver 都不需要这一步。
+上述注册属于标准降级管线所需的基础运行环境，与性能追踪工具本身解耦；任何已完整支持上述 Pass 家族的标准 MLIR 驱动环境均可直接复现上述测试结果。

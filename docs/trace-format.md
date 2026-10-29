@@ -1,112 +1,195 @@
-# Trace 格式规范（schema `op-timing`，version 1）
+# Trace 数据协议规范（Schema `op-timing`，Version 1）
 
-本文件定义 `OpTimingProfiler.h` 输出的文件格式，以及 `op-timing-report.py` 读取它时依赖的全部约定。目的只有一个：**任何采集器**（不限于本仓库的 header）只要按本规范写文件，就能被同一个分析脚本读取，不需要改脚本。
+本文档定义 `OpTimingProfiler.h` 导出的追踪数据格式规范，以及 `op-timing-report.py` 解析追踪流时遵循的数据协议契约。遵循本规范的任何第三方采集器输出的追踪文件，均可直接被本仓库提供的分析脚本解析与聚合。
 
-读取方是 `tools/op-timing-report.py`；写入方的参考实现是 `include/OpTimingProfiler.h`。
+- **写入参考实现**：`include/OpTimingProfiler.h`
+- **解析参考实现**：`tools/op-timing-report.py`
 
 ---
 
-## 1. 容器
+## 1. 顶层容器与元数据事件
 
-一个 JSON 数组，元素是事件对象。也接受 Chrome Trace 的包装形式 `{"traceEvents": [...]}`，读取方会自动展开。
+追踪数据顶层为 JSON 数组结构，内部元素由按时序记录的事件对象组成。解析器同时兼容 Chrome Trace 的顶层封装格式（即 `{"traceEvents": [...]}` 对象）。
 
-第一条元素是**元数据事件**：
+数据流的首个元素为**格式元数据事件**：
 
 ```json
-{"ph":"M","name":"optiming_format","pid":0,"args":{"schema":"op-timing","version":1}}
+{
+  "ph": "M",
+  "name": "optiming_format",
+  "pid": 0,
+  "args": {
+    "schema": "op-timing",
+    "version": 1
+  }
+}
 ```
 
-- `version` 是整数，当前为 `1`。
-- 缺失该事件时，读取方按 `version: 1` 处理（兼容早期无标记的文件）。
-- `ph: "M"` 是 Chrome Trace 的元数据类型，图形化查看器会忽略它，不影响 `chrome://tracing` / Perfetto / speedscope 的加载。
+- `version`：协议版本标识，当前固定为整数 `1`。
+- 若缺少该元数据事件，解析器默认按 `version: 1` 协议向下兼容处理。
+- `ph: "M"`：遵循 Chrome Trace Event 的元数据定义标准，第三方可视化工具（Perfetto、Speedscope、`chrome://tracing`）加载时将自动忽略该事件，不影响时间轴渲染。
 
-## 2. 事件字段
+---
 
-| 字段 | 要求 | 说明 |
+## 2. 事件对象字段规范
+
+| 字段 | 约束 | 数据类型 | 说明 |
+| --- | --- | --- | --- |
+| `ph` | 必选 | 字符串 | 事件阶段类型：`"B"`（Begin，区间开始）或 `"E"`（End，区间结束）。支持 `"X"`（Complete，自带持续时间 `dur` 的独立区间事件，其 `self` 与 `dur` 相等且不参与栈配对）。`"M"` 仅用于文件元数据。 |
+| `name` | 必选 | 字符串 | 动作标识（Action Tag），决定聚合报告中的归因视图（参见第 3 节）。 |
+| `ts` | 必选 | 浮点数 | 事件起始时间戳，单位为**微秒（µs）**。时间原点可任意指定，但同文件内必须保持全局统一基准。 |
+| `tid` | 必选 | 整数 | 线程 ID。调用栈配对与嵌套追踪严格限制在同一 `tid` 内部进行。 |
+| `pid` | 必选 | 整数 | 进程 ID 保留字段。当前实现固定填 `0`，解析器不用于聚合计算。 |
+| `cat` | 可选 | 字符串 | 事件类别分类标识，当前实现固定为 `"op-timing"`，用于可视化查看器分类过滤。 |
+| `args` | 条件必选 | 对象 | 事件属性参数。`B` 与 `X` 事件必须提供，`E` 事件无需提供（参见第 4 节）。 |
+
+---
+
+## 3. 动作标识分类与视图映射
+
+解析器根据 `name` 字段将事件分流至不同的聚合统计视图：
+
+| `name` 标识值 | 对应业务语义 | 分析脚本映射规则 |
 | --- | --- | --- |
-| `ph` | 必需 | `"B"`（开始）或 `"E"`（结束）。`"X"`（自带 `dur` 的完整事件）也接受，自带 `self = dur`，不参与配对。`"M"` 仅用于元数据。 |
-| `name` | 必需 | 动作 tag，决定归因视图，见第 3 节。 |
-| `ts` | 必需 | 开始时刻，**微秒**，浮点。原点任意，只要同一文件内一致。 |
-| `tid` | 必需 | 线程 id，整数。配对只在同一 `tid` 内进行。 |
-| `pid` | 必需（固定 `0`） | 保留字段。当前实现恒为 `0`，读取方不使用。 |
-| `cat` | 可选（固定 `"op-timing"`） | 保留字段，供查看器分组。读取方不使用，因此改名不影响分析结果。 |
-| `args` | `B` 事件必需，`E` 事件无 | 见第 4 节。 |
+| `pass-execution` | 单次 Pass 执行生命周期 | 映射至 `per_pass` 视图。提取 `args.pass` 作为标识标签（格式为 `pass: <name>`）；若 `args.pass` 以 `OpToOpPassAdaptor` 结尾，则自动折叠合并为 `pass: <nested pipeline>`。 |
+| `apply-pattern` | 单次 Pattern 改写尝试 | 映射至 `per_operation` 视图。该区间的 `self` 耗时归因至被改写的 Operation 实例。 |
+| 其他自定义 Tag | 自定义动作作用域 | 原样映射至 `per_scope` 视图。除非 Tag 显式命名为 `pass-execution`，否则不进入 `per_pass` 视图。 |
 
-## 3. `name` 的取值与归因
+注：MLIR 原生派发的第三类动作标识 `GreedyPatternRewriteIteration` 在报告中将格式化显示为 `greedy-iteration`。
 
-| `name` | 含义 | 分析脚本的处理 |
+---
+
+## 4. 属性参数（`args`）规范
+
+属性对象挂载于开始事件（`ph: "B"`）或完整事件（`ph: "X"`）中，所有子字段均为字符串类型且均为可选字段。当字段缺失时，解析器将回退至空值或降级规则：
+
+| 参数字段 | 字段语义 | 缺失时的降级行为 |
 | --- | --- | --- |
-| `pass-execution` | 一次 pass 执行 | 进入 `per_pass`；`args.pass` 生成标签 `pass: <name>`；`args.pass` 以 `OpToOpPassAdaptor` 结尾时折叠为 `pass: <nested pipeline>` |
-| `apply-pattern` | 一次 pattern 尝试 | 进入 `per_operation`（`self` 记为被改写 op 的耗时） |
-| 其它任意 tag | 自定义动作 | 原样进入 `per_scope`；不进入 `per_pass`，除非 tag 为 `pass-execution` |
+| `desc` | 动作的文本描述信息 | 聚合标签回退至 `name` 字段本身 |
+| `op` | 动作作用的目标 Operation 类型（如 `linalg.generic`） | `per_operation` 视图中对应记录的 `op` 留空 |
+| `sym` | Operation 绑定的符号名称（`sym_name` 属性，如 `main`） | `per_operation` 视图中对应记录的 `sym` 留空 |
+| `loc` | 源码物理位置（`file:line:col` 或符号位置名） | `per_operation` 视图中对应记录的 `loc` 留空 |
+| `pass` | Pass 结构化类名（由 `Pass::getName()` 导出） | 尝试从 `desc` 文本描述中提取；提取失败则回退至 `pass-execution` |
+| `arg` | Pass 命令行选项名称（由 `Pass::getArgument()` 导出） | `per_pass` 视图中对应记录的 `arg` 留空 |
 
-`GreedyPatternRewriteIteration` 是上游 MLIR 的第三个 tag，脚本显示为 `greedy-iteration`。
+规范说明：`desc` 供第三方可视化工具展示人类可读文本，`pass` 与 `op` 提供离线分析的结构化分类标识。第三方采集器在派发 `pass-execution` 时应至少提供 `pass` 字段；在派发改写动作时应至少提供 `op` 与 `loc` 字段，以确保 Operation 级的统计与归因有效。
 
-## 4. `args` 字段
+---
 
-只出现在 `B` 事件上。全部为字符串，全部可选；读取方对缺失字段回退到空值。
+## 5. 协议语义约束与不变式
 
-| 字段 | 含义 | 缺失时 |
-| --- | --- | --- |
-| `desc` | 人类可读描述，自由文本 | 标签退化为 `name` 本身 |
-| `op` | 该动作作用在哪个 op 上，如 `linalg.generic` | `per_operation` 中该行 `op` 为空 |
-| `sym` | op 的符号名（`sym_name`），如 `main` | `per_operation` 中该行 `sym` 为空 |
-| `loc` | 源位置，`file:line:col` 或符号位置名 | `per_operation` 中该行 `loc` 为空 |
-| `pass` | pass 名（`Pass::getName()`） | 回退到从 `desc` 解析 |
-| `arg` | pipeline 选项名（如 `canonicalize`），仅 `pass-execution` 有意义 | `per_pass` 中该行 `arg` 为空 |
+第三方写入程序必须满足以下语义约束，否则会导致聚合指标产生计算偏差：
 
-`desc` 与 `pass` 并存是刻意的：前者供人读，后者是结构化身份。新采集器**至少**应填 `pass`（若发 `pass-execution`）与 `op`/`loc`（若希望 op 级归因成立），`desc` 可以留空。
+1. **调用栈严格后进先出（LIFO）嵌套**：相同 `tid` 内的 `B` 与 `E` 事件必须满足调用栈的严格嵌套。严禁跨线程交叠配对。
+2. **区间闭合完整性**：每一个 `B` 事件必须存在相同线程内的对应 `E` 事件。未闭合的 Span 区间将在离线后处理时被直接丢弃。
+3. **区间单次发射约束**：同一段业务逻辑的执行时间只能由单一的 `B`/`E` 区间对包围。自耗时（`self`）由解析器通过 `当前区间总耗时 − 直接子区间耗时之和` 计算，重复发射嵌套区间会导致父区间的自耗时被错误扣除。
+4. **时间戳单调递增性**：同一线程内写出的事件时间戳必须单调不减。
+5. **事件间隙的框架开销归属**：`pass-execution` 的 `E` 事件至同线程后续首个事件之间的未覆盖物理时间，解析器将归因于对应 Pass 的框架非区间耗时（`outside`）。该间隙在 MLIR 参考实现中对应 IR 验证器（`mlir::verify`）与分析失效（`AnalysisManager::invalidate`）。若第三方编译器在此间隙内调度了其他工作，相关耗时亦将累加至 `outside` 指标中。
 
-## 5. 语义要求
+---
 
-写入方必须满足以下五条，否则分析的数值会错（而不是报错）：
+## 6. 协议演进规则
 
-1. **严格嵌套**：同一 `tid` 上 `B`/`E` 必须后进先出。跨线程嵌套不允许。
-2. **成对**：每个 `B` 都要有对应 `E`。进程退出时仍未闭合的 span 会被丢弃。
-3. **不重复**：一个时间区间只能发一对 `B`/`E`。`self` 由读取方按 `dur − 子 span 之和` 计算，重复发放会让父 span 的 `self` 偏小。
-4. **`ts` 单调**：同一 `tid` 上按时间递增写出。
-5. **间隙归属**：`pass-execution` 的 `E` 到下一条同线程事件之间的间隔，会被读取方记为**框架开销**（`per_pass[].outside`），语义是"该 pass 结束后、下一个动作开始前，不在任何 span 内的耗时"。参考实现里这段就是 MLIR 的 after-pass 验证器与分析失效（`mlir/lib/Pass/Pass.cpp:534-557`）。若宿主的 pass 执行框架在这段间隔里还有别的工作，它会被一起算进 `outside`——这是本格式唯一的语义约定，采集器无法通过字段澄清，只能在文档里说明。
+- **向前兼容扩展**：新增可选属性字段或新增 `name` 动作标识时，保持 `version: 1` 不变。解析器必须主动忽略未识别的未知字段。
+- **破坏性变更升级**：修改现有字段的数据语义、删除核心字段或变更区间配对与间隙归属规则时，协议版本号必须自增（如升级为 `version: 2`），并在本规范中详细记录变更差异。
 
-## 6. 版本演进
+---
 
-- 增加可选字段：`version` 不变。读取方必须忽略不认识的字段。
-- 改变字段含义、删除字段、改变配对/间隙语义：`version` 加一，并在本文件记录差异。
+## 7. 采集器最小参考实现
 
-## 7. 最小实现示例
-
-C++（任意编译器，不必是 MLIR）：
+### C++ 参考实现（独立于 MLIR）
 
 ```cpp
-std::chrono::steady_clock::time_point origin = std::chrono::steady_clock::now();
-auto micros = [&] {
-  return std::chrono::duration<double, std::micro>(
-             std::chrono::steady_clock::now() - origin).count();
+#include <chrono>
+#include <fstream>
+#include <thread>
+
+class SimpleTraceWriter {
+public:
+  SimpleTraceWriter(std::ostream &os) : out(os) {
+    origin = std::chrono::steady_clock::now();
+    out << R"([{"ph":"M","name":"optiming_format","pid":0,)"
+        << R"("args":{"schema":"op-timing","version":1}})";
+  }
+
+  ~SimpleTraceWriter() {
+    out << "\n]\n";
+  }
+
+  void tracePass(const char *passName, const char *arg, auto &&fn) {
+    emitEvent("pass-execution", "B", passName, arg);
+    fn();
+    emitEvent("pass-execution", "E", nullptr, nullptr);
+  }
+
+private:
+  double nowUs() {
+    return std::chrono::duration<double, std::micro>(
+        std::chrono::steady_clock::now() - origin).count();
+  }
+
+  void emitEvent(const char *name, const char *ph, const char *pass, const char *arg) {
+    out << ",\n"
+        << R"({"name":")" << name << R"(","cat":"op-timing","ph":")" << ph
+        << R"(","pid":0,"tid":1,"ts":)" << nowUs();
+    if (ph[0] == 'B') {
+      out << R"(,"args":{"pass":")" << pass << R"(","arg":")" << arg << R"("})";
+    }
+    out << "}";
+  }
+
+  std::ostream &out;
+  std::chrono::steady_clock::time_point origin;
 };
-out << R"([{"ph":"M","name":"optiming_format","pid":0,)"
-       R"("args":{"schema":"op-timing","version":1}})";
-out << "\n" << R"({"name":"pass-execution","cat":"op-timing","ph":"B","pid":0,"tid":)"
-    << tid << R"(,"ts":)" << micros()
-    << R"(,"args":{"pass":"MyPass","arg":"my-pass","op":")" << opName << "\"}";
-runMyPass();
-out << "\n" << R"({"name":"pass-execution","cat":"op-timing","ph":"E","pid":0,"tid":)"
-    << tid << R"(,"ts":)" << micros() << "}]";
 ```
 
-Python：
+### Python 参考实现
 
 ```python
-events = [{"ph": "M", "name": "optiming_format", "pid": 0,
-           "args": {"schema": "op-timing", "version": 1}}]
-t0 = time.perf_counter()
-events.append({"name": "pass-execution", "cat": "op-timing", "ph": "B",
-               "pid": 0, "tid": threading.get_ident(),
-               "ts": (time.perf_counter() - t0) * 1e6,
-               "args": {"pass": "MyPass", "op": "my.op"}})
-run_my_pass()
-events.append({"name": "pass-execution", "cat": "op-timing", "ph": "E",
-               "pid": 0, "tid": threading.get_ident(),
-               "ts": (time.perf_counter() - t0) * 1e6})
-json.dump(events, open("trace.json", "w"))
+import json
+import threading
+import time
+
+
+class SimpleTraceCollector:
+    def __init__(self):
+        self.events = [{
+            "ph": "M",
+            "name": "optiming_format",
+            "pid": 0,
+            "args": {"schema": "op-timing", "version": 1}
+        }]
+        self.origin = time.perf_counter()
+
+    def record_pass(self, pass_name, arg_name, func):
+        tid = threading.get_ident()
+        ts_begin = (time.perf_counter() - self.origin) * 1e6
+        self.events.append({
+            "name": "pass-execution",
+            "cat": "op-timing",
+            "ph": "B",
+            "pid": 0,
+            "tid": tid,
+            "ts": ts_begin,
+            "args": {"pass": pass_name, "arg": arg_name}
+        })
+
+        try:
+            return func()
+        finally:
+            ts_end = (time.perf_counter() - self.origin) * 1e6
+            self.events.append({
+                "name": "pass-execution",
+                "cat": "op-timing",
+                "ph": "E",
+                "pid": 0,
+                "tid": tid,
+                "ts": ts_end
+            })
+
+    def export(self, filepath):
+        with open(filepath, "w") as f:
+            json.dump(self.events, f, indent=2)
 ```
 
-两者都可以直接用 `op-timing-report.py trace.json --table` 读取。
+两类实现生成的追踪文件均可直接通过 `python3 tools/op-timing-report.py <trace-file> --table` 进行聚合与展示。
