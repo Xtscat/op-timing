@@ -35,8 +35,6 @@ namespace optiming {
 /// context in the process, so all of them share one file and one time origin.
 class OpTimingProfiler {
 public:
-  static constexpr int kFormatVersion = 1;
-
   /// Open `path` for writing, or stderr when `path` is "-".
   explicit OpTimingProfiler(llvm::StringRef path)
       : start(std::chrono::steady_clock::now()) {
@@ -59,7 +57,7 @@ public:
 
   ~OpTimingProfiler() {
     if (os)
-      *os << "]\n";
+      *os << "\n]\n";
   }
 
   OpTimingProfiler(const OpTimingProfiler &) = delete;
@@ -90,21 +88,19 @@ public:
   }
 
 private:
-  /// `[` plus the format marker: a `ph: "M"` event, which trace viewers ignore
-  /// and which tells readers the schema version.
-  void openArray() {
-    *os << "[\n"
-        << R"({"ph":"M","name":"optiming_format","pid":0,)"
-        << R"("args":{"schema":"op-timing","version":)" << kFormatVersion
-        << "}}";
-    first = false;
-  }
+  /// `[`: every event is written on its own line, so readers can stream the
+  /// file instead of loading it whole.
+  void openArray() { *os << "[\n"; }
 
   void printEvent(const mlir::tracing::Action &action, llvm::StringRef phase,
                   std::chrono::steady_clock::time_point timestamp) {
-    const double micros =
-        std::chrono::duration<double, std::micro>(timestamp - start).count();
-    *os << (first ? "\n" : ",\n");
+    // Integer microseconds: a `double` would be printed with the default
+    // 6-decimal exponential format, i.e. only 7 significant digits, which
+    // quantizes every timestamp past 10 s to 1 ms (docs/trace-format.md).
+    const auto micros = std::chrono::duration_cast<std::chrono::microseconds>(
+                            timestamp - start)
+                            .count();
+    *os << (first ? "" : ",\n");
     first = false;
     *os << R"({"name":")";
     writeEscaped(action.getTag());

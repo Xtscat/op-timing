@@ -80,16 +80,15 @@ context.executeAction<MyPassAction>([&] {
 # 1. 采集：配置环境变量 OP_TIMING 指定输出路径（"-" 表示标准错误输出）
 OP_TIMING=/tmp/op_trace.json <your-tool> input.mlir -o /dev/null
 
-# 2. 离线聚合：默认生成同名 report.json 文件并在控制台打印摘要
+# 2. 离线聚合：唯一参数是追踪文件，脚本不接受任何选项
 python3 tools/op-timing-report.py /tmp/op_trace.json
-# 输出文件路径：/tmp/op_trace.json.report.json
-
-# 3. 终端可视化：输出 Pass、Operation 及 Scope 三维度排名表格（展示前 20 项）
-python3 tools/op-timing-report.py /tmp/op_trace.json --table --top 20
-
-# 4. 性能回归比对：比对基线报告，当任意项 self 耗时增长超过 1.20 倍且绝对耗时大于 200 µs 时返回非零退出码
-python3 tools/op-timing-report.py new.json --baseline base.report.json
 ```
+
+每次运行固定执行三项输出任务，无需额外开关：
+
+1. 在控制台打印采集概况（总耗时、耗时构成三段、无动作区间）与三张排名表格（Pass、算子、算子×动作，各展示前 20 项）；
+2. 在与追踪文件同目录、同基名下写出 `<trace>.report.json`；
+3. 写出 `<trace>.report.xlsx`。
 
 原始追踪文件可直接导入 Chrome 追踪查看器（`chrome://tracing`）、[Perfetto UI](https://ui.perfetto.dev) 或 [Speedscope](https://speedscope.app)，进行调用栈时序展开与线程并发分析。
 
@@ -98,41 +97,43 @@ python3 tools/op-timing-report.py new.json --baseline base.report.json
 | 产物文件 | 数据特性 | 应用场景 |
 | --- | --- | --- |
 | `<trace>.json` | 原始 `B`/`E` 时间戳事件流，不包含聚合自耗时或统计计数值 | 图形化时间线渲染、线程并发状态分析、对接第三方追踪平台 |
-| `<trace>.report.json` | 离线计算得出的结构化聚合结果（涵盖 `self`、`incl`、`count`、`worst`、`outside`） | CI 性能门禁比对、回归测试、自动化性能指标提取 |
+| `<trace>.report.json` | 离线计算得出的结构化聚合结果（涵盖 `self`、`incl`、`count`、`worst`、`outside`） | 自动化指标提取、报表二次处理 |
+| `<trace>.report.xlsx` | 随 `report.json` 一同生成的工作簿：`总览`、`Pass`、`算子`、`算子×动作`、`说明` 五个工作表，数值与 `report.json` 逐字段一致（设计说明见 `docs/excel.md`） | 人工浏览、评审汇报、表格工具内二次统计 |
 
 ---
 
 ## 3. 聚合报告（`report.json`）格式规范
 
+全部时间字段统一为秒（s）；原始追踪事件的时间戳为整数微秒（`docs/trace-format.md`），脚本在聚合时换算。`per_scope` 聚合键为 `(op, scope)`，各行按 `op` 分组（组间按 `self` 总和降序、组内按 `self` 降序）。报告不含版本号：解析器忽略无法识别的字段，字段语义变更时直接更新本文档。
+
 ```json
 {
-  "schema_version": 1,
   "trace": "<输入追踪文件路径>",
-  "wall_ms": 1817.38,
-  "inside_actions_ms": 1111.24,
-  "outside_actions_ms": 778.85,
+  "total_s": 1.81738,
+  "inside_actions_s": 1.11124,
+  "outside_actions_s": 0.77885,
   "threads": 1,
-  "unit": "us (self, incl, worst, outside) / ms (wall_ms, inside_actions_ms, outside_actions_ms)",
+  "scopes": 45033,
+  "unit": "s",
   "per_operation": [
     {
       "op": "linalg.generic",
       "sym": "",
       "loc": "model.mlir:1356:13",
       "count": 32,
-      "self": 1024.5,
-      "incl": 1024.5,
-      "worst": 45.2
+      "self": 0.0010245,
+      "incl": 0.0010245,
+      "worst": 0.0000452
     }
   ],
   "per_scope": [
     {
-      "scope": "Canonicalizer",
       "op": "func.func",
-      "loc": "model.mlir:2:3",
+      "scope": "pass: Canonicalizer",
       "count": 3,
-      "self": 6780.2,
-      "incl": 236790.1,
-      "worst": 82000.4
+      "self": 0.0067802,
+      "incl": 0.2367901,
+      "worst": 0.0820004
     }
   ],
   "per_pass": [
@@ -140,10 +141,10 @@ python3 tools/op-timing-report.py new.json --baseline base.report.json
       "scope": "pass: ConvertFuncToLLVMPass",
       "arg": "convert-func-to-llvm",
       "count": 1,
-      "self": 45620.0,
-      "incl": 76450.0,
-      "worst": 45620.0,
-      "outside": 133960.0
+      "self": 0.04562,
+      "incl": 0.07645,
+      "worst": 0.04562,
+      "outside": 0.13396
     }
   ]
 }
@@ -153,17 +154,27 @@ python3 tools/op-timing-report.py new.json --baseline base.report.json
 
 | 字段 | 计量单位 | 语义与应用方法 |
 | --- | --- | --- |
-| `self` | 微秒（µs） | **自耗时**：当前区间耗时剔除内部所有嵌套子动作后的净值。**系统瓶颈排查的核心依据**。 |
-| `incl` | 微秒（µs） | **包含耗时**：当前区间的起止累计总耗时（包含全部子动作）。**分析跨层级耗时扩散时参考**。 |
+| `self` | 秒（s） | **自耗时**：当前区间耗时剔除内部所有嵌套子动作后的净值。**系统瓶颈排查的核心依据**。 |
+| `incl` | 秒（s） | **包含耗时**：当前区间的起止累计总耗时（包含全部子动作）。**分析跨层级耗时扩散时参考**。 |
 | `count` | 次数 | 动作触发累计频次（在改写视图中对应候选 Pattern 的匹配尝试次数）。 |
-| `worst` | 微秒（µs） | 单次触发的最大耗时值。 |
-| `outside` | 微秒（µs） | `pass-execution` 结束事件（`E`）至同线程下一事件之间的墙钟间隔，对应 Pass 后的 IR 验证与分析失效开销。 |
+| `worst` | 秒（s） | 单次触发的最大耗时值。 |
+| `outside` | 秒（s） | `pass-execution` 结束事件（`E`）至同线程下一事件之间的时间间隔，对应 Pass 后的 IR 验证与分析失效开销。多线程宿主下该值包含线程阻塞等待，**不可跨行相加**，且与无动作区间存在重叠（同一段时间不计两次，见 `docs/excel.md` 第 3.1 节的耗时构成）（详见 `docs/measurement.md` 第 1.4 节）。 |
+| `scopes` | 次 | 计入统计的动作区间总数（不含未闭合区间与孤立结束事件）。 |
 | `arg` | 字符串 | Pass 对应的命令行选项名称（例如 `canonicalize`），用于将分析结果映射回编译管线配置。 |
 
 - **`per_operation` 视图**：仅统计改写类动作（其 IR 单元直接对应被操作的 Operation），反映哪些 Operation 实例的改写开销显著，不包含 Pass 自身的调度逻辑。
-- **`per_scope` 视图**：动作名称、Operation 实例及源码位置的全集展开，包含贪心重写驱动循环与 Pass 本身。
+- **`per_scope` 视图**：按 Operation 类型 × 动作名称聚合的全集展开，包含贪心重写驱动循环与 Pass 本身；同一 Operation 的各行相邻排列（组间按 `self` 总和降序、组内按 `self` 降序），用于观察同一算子被多条 Pattern 重复作用的情况。源码行级归因由 `per_operation` 视图承担。
 
-指标更深层次的数学关联与解读规则详见 `docs/measurement.md`。
+指标更深层次的数学关联与解读规则详见 `docs/measurement.md`；Excel 工作簿的结构、列定义与阅读指南详见 `docs/excel.md`。
+
+### 未计入统计的数据
+
+分析脚本在控制台显式报告两类不进表的数据，避免把它们的缺失误读为零开销：
+
+| 情形 | 控制台输出 | 处理方式 |
+| --- | --- | --- |
+| 进程在动作执行中退出，最后一个区间只有开始事件 | `warning: N span(s) never closed` | 计数并排除；不纳入 `scopes`、`self`、`inside_actions_s` |
+| 无动作区间（该线程不处于任何动作区间内的时段） | `无动作区间（各线程并集） … 分布在 N 段` 与逐线程合计 | 单独报告。它是各线程并集，不可跨线程相加；扣除 `outside` 已覆盖的部分后，余量在「耗时构成」中作为其余空闲一行列出 |
 
 ---
 
@@ -178,6 +189,8 @@ cmake --build /tmp/build-op-timing
 
 该构建仅编译 `tests/syntax-check.cpp`，旨在验证头文件对宿主工程环境的解耦性。
 
+分析脚本的回归测试无需构建环境，直接运行 `python3 tests/test_report.py` 即可；独立构建时会一并注册为 `ctest` 用例 `op-timing-report`。
+
 ---
 
 ## 5. 编译与控制参数一览
@@ -185,8 +198,8 @@ cmake --build /tmp/build-op-timing
 | 配置项 | 归属 | 功能说明 |
 | --- | --- | --- |
 | `OP_TIMING=<path>` | 本模块 | 指定追踪文件写出路径。未设置该环境变量时保持零开销。 |
-| `--verify-each=false` | 上游 `mlir-opt` | 关闭每个 Pass 执行完毕后的全量 IR 验证。该参数仅影响整体物理时间和报告中的 `outside` 指标，不影响 Pass 的 `self` 自耗时。 |
-| `--emit-bytecode` | 上游 `mlir-opt` | 启用 MLIR 字节码输出格式替代默认文本输出，避免文本格式化产生的开销（基准测试下约可降低 250 ms/MB）。 |
+| `--verify-each=false` | 上游 `mlir-opt` | 关闭每个 Pass 执行完毕后的全量 IR 验证。该参数仅影响整体物理时间和报告中的 `outside` 指标，不影响 Pass 的 `self` 自耗时。仅单线程采集时可将 `outside` 的降幅读作验证开销。 |
+| `--emit-bytecode` | 上游 `mlir-opt` | 启用 MLIR 字节码输出格式替代默认文本输出，避免文本格式化产生的开销（基准测试下约可降低 0.25 秒/MB）。 |
 | `-o <file>` | 上游 `mlir-opt` | 指定编译输出目标。使用 `-o /dev/null` 时编译器仍会执行 IR 格式化流程；若需规避该开销需配合 `--emit-bytecode`。 |
 | `-mlir-timing` | 上游 PassTiming | 输出进程生命周期预算（Parser、Pass、Output 及 Rest），可与本工具并发启用。 |
 | `-mlir-disable-threading` | 上游运行时 | 禁用 PassManager 的多线程并发调度，使各线程时间开销具备严格可加性。 |

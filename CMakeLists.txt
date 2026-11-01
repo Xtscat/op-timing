@@ -33,4 +33,14 @@ if(OP_TIMING_STANDALONE)
   set_target_properties(op-timing-syntax-check PROPERTIES
     CXX_STANDARD 17
     CXX_STANDARD_REQUIRED ON)
+
+  # The aggregation script is tested without a build environment too:
+  # `python3 tests/test_report.py` runs the same suite directly.
+  enable_testing()
+  find_package(Python3 COMPONENTS Interpreter)
+  if(Python3_Interpreter_FOUND)
+    add_test(NAME op-timing-report
+      COMMAND ${Python3_EXECUTABLE}
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_report.py)
+  endif()
 endif()

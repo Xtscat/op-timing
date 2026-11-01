@@ -11,12 +11,14 @@ MLIR 原生工具中，`-mlir-timing` 仅提供 Pass 级别的耗时聚合，未
 | 路径 | 说明 |
 | --- | --- |
 | `include/OpTimingProfiler.h` | Header-only 采集器：实现只读 Action Handler 并流式写出 Chrome Trace 数据 |
-| `tools/op-timing-report.py` | 离线分析脚本：执行区间配对并计算 `self`、`incl`、`count`、`worst` 与 `outside` 指标，支持性能基线比对 |
+| `tools/op-timing-report.py` | 离线分析脚本：流式读取追踪并计算 `self`、`incl`、`count`、`worst` 与 `outside` 指标，输出 `report.json` 与 Excel 报表；无命令行选项 |
 | `tests/syntax-check.cpp` | 语法检查测试：在独立构建模式下验证头文件对外部宿主环境的零依赖性 |
+| `tests/test_report.py` | 分析脚本回归测试：覆盖完整事件、视图归属、`outside` 归因、多线程口径与 Excel 布局，运行 `python3 tests/test_report.py` |
 | `docs/design.md` | 系统设计：Action 框架原理、挂载机制、只读性约束与维护不变量 |
 | `docs/usage.md` | 接入与使用指南：宿主接入流程、运行指令、聚合报告字段说明与参数开关 |
+| `docs/excel.md` | Excel 报表设计说明：工作簿结构、列定义、计算口径与阅读指南 |
 | `docs/measurement.md` | 度量口径与测试数据：度量口径定义、基准性能数据、开销评估与复现流程 |
-| `docs/trace-format.md` | 追踪格式规范（Schema `op-timing` v1）：协议规范与第三方采集器实现参考 |
+| `docs/trace-format.md` | 追踪格式规范：事件字段、视图映射、语义不变量与第三方采集器实现参考 |
 
 ## 快速接入
 
@@ -43,9 +45,11 @@ registry.addExtension(optiming::installOpTimingOnContext);
 # 执行编译并导出追踪文件
 OP_TIMING=/tmp/op_trace.json <your-tool> input.mlir -o /dev/null
 
-# 生成聚合报告并输出格式化表格
-python3 tools/op-timing-report.py /tmp/op_trace.json --table
+# 生成聚合报告与 Excel 报表，并在控制台打印三张排名表格
+python3 tools/op-timing-report.py /tmp/op_trace.json
 ```
+
+唯一参数是追踪文件本身；脚本不接受选项，两个产物（`/tmp/op_trace.report.json` 与 `/tmp/op_trace.report.xlsx`）固定写在追踪文件同目录、同基名下。
 
 当环境变量 `OP_TIMING` 未配置时，采集器不会注册任何 Handler，`MLIRContext::hasActionHandler()` 保持为 `false`，编译执行路径与未引入本模块时完全一致，运行时开销为零。
 

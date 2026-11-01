@@ -133,9 +133,9 @@ optiming::installOpTimingIfRequested(*context);
 
 | 视图 | 聚合维度 | 分析目标 |
 | --- | --- | --- |
-| `per_pass` | Pass 名称 | 分析 Pass 级性能分布；`outside` 指标反映 Pass 后的框架验证与分析失效代价 |
-| `per_operation` | Operation 类型 + 符号名 + 源码位置 | 分析改写类动作在具体 Operation 实例上的开销分布 |
-| `per_scope` | 动作标识 × Operation 实例 × 源码位置 | 全集视图，包含 Pass 执行、贪心重写驱动循环及具体改写动作 |
+| `per_pass` | Pass 名称 | 分析 Pass 级性能分布；单线程采集时 `outside` 指标反映 Pass 后的框架验证与分析失效代价 |
+| `per_operation` | Operation 类型 + 符号名 + 源码位置 | 分析改写类动作（`apply-pattern`）在具体 Operation 实例上的开销分布 |
+| `per_scope` | Operation 类型 × 动作标识 | 全集视图，包含 Pass 执行、贪心重写驱动循环及具体改写动作；按 Operation 分组（组间按 `self` 总和降序、组内按 `self` 降序） |
 
 ### 指标定义
 
@@ -143,7 +143,13 @@ optiming::installOpTimingIfRequested(*context);
 - **包含耗时（`incl`）**：当前区间自开始至结束的累计耗时，包含所有内部嵌套子动作。**定位跨层级耗时扩散时参考该指标**（例如某 Pass 自身逻辑耗时较低，但包含耗时较高，表明其主要开销由其触发的子改写驱动产生）。
 - **执行次数（`count`）**：动作被触发的累计频次（在 Pattern 视图下即为候选匹配尝试次数）。
 - **单次最大耗时（`worst`）**：该聚合项单次调用的最大耗时。
-- **框架非区间耗时（`outside`）**：`pass-execution` 的 `E` 事件至同线程下一事件之间的墙钟间隔，用于隔离框架级验证器（`mlir::verify`）与分析失效（`AnalysisManager::invalidate`）的开销。推导原理参见 `measurement.md`。
+- **框架非区间耗时（`outside`）**：`pass-execution` 的 `E` 事件至同线程下一事件之间的时间间隔，用于隔离框架级验证器（`mlir::verify`）与分析失效（`AnalysisManager::invalidate`）的开销。推导原理参见 `measurement.md`。
+
+### 输出产物
+
+分析脚本不接受任何选项：给定追踪文件后，其固定执行三项输出任务——在控制台打印采集概况与三张排名表（Pass、算子、算子×动作，各前 20 行），写出 `<trace>.report.json`，写出 `<trace>.report.xlsx`。两个文件固定保存在追踪文件同目录、同基名下，不提供路径与筛选开关。工作簿结构见 `docs/excel.md`。
+
+除三张表外，控制台还报告两类不进表的数据：未闭合区间与孤立结束事件的计数，以及无动作区间（该线程不处于任何动作区间内的时段）的并集总量、段数与逐线程分布。后者在多线程采集下远大于任何单线程视角的间隙，用于说明「总耗时用在哪里」；它不并入任何指标，只与 `outside` 扣除重叠后一起构成控制台的「耗时构成」三段：动作内 `self`、动作外（无动作）、其余空闲。
 
 ---
 
@@ -163,7 +169,7 @@ optiming::installOpTimingIfRequested(*context);
 
 ### 3. 多线程模式下的指标可加性约束
 
-`wall_ms` 为墙钟物理时间，各动作的 `self` 耗时为所有线程 CPU 时间的离散累加，两者的比值在并发场景下可超出 100%。当后处理脚本检测到多线程事件时将输出提示信息。若需要严格可加的性能统计指标，需启用 `-mlir-disable-threading` 单线程模式。在多线程模式下，`outside` 亦会受线程调度等待延迟影响。
+`total_s` 为实际经过时间，各动作的 `self` 耗时为所有线程 CPU 时间的离散累加，两者的比值在并发场景下可超出 100%。当后处理脚本检测到多线程事件时将输出提示信息。若需要严格可加的性能统计指标，需启用 `-mlir-disable-threading` 单线程模式。在多线程模式下，`outside` 还会被线程调度等待延迟放大，且是各线程未覆盖时间的算术和，不可跨行相加。
 
 ### 4. 嵌套 Pipeline 的自耗时校准
 
@@ -175,17 +181,19 @@ optiming::installOpTimingIfRequested(*context);
 
 对本模块进行迭代维护时，必须保证以下不变量：
 
-1. **只读性约束**：新增逻辑仅能读取上下文状态，严禁修改 IR 结构或干预 `transform()` 的控制流。
-2. **默认零开销**：当未配置 `OP_TIMING` 时，严禁注册 Handler、严禁分配内部缓冲区或执行文件 I/O。
-3. **公共 API 依赖**：仅依赖 MLIR 公共头文件接口（`MLIRContext::registerActionHandler`、`tracing::Action`、`PassExecutionAction` 等），杜绝依赖私有实现或对 LLVM/MLIR 上游打补丁。
-4. **格式向前兼容**：追踪文件新增字段必须设计为可选字段；仅在打破现有解析契约时升级协议版本号（Schema Version）。
+1. **只读性约束**：新增逻辑仅能读取上下文状态，严禁修改 IR 结构或改变 `transform()` 的控制流。
+2. **默认零开销**：当未配置 `OP_TIMING` 时，禁止注册 Handler、禁止分配内部缓冲区或执行文件 I/O。
+3. **公共 API 依赖**：仅依赖 MLIR 公共头文件接口（`MLIRContext::registerActionHandler`、`tracing::Action`、`PassExecutionAction` 等），杜绝依赖私有实现或对 LLVM/MLIR 上游源码打补丁。
+4. **格式向前兼容**：追踪文件新增字段必须设计为可选字段；解析器忽略无法识别的字段，不引入版本号标记，字段语义变更时同步更新 `docs/trace-format.md`。
 5. **结构化字段优先**：后处理解析逻辑优先读取结构化字段（`pass`、`arg`、`op`、`loc`），文本描述字段（`desc`）仅作为后备降级手段。
+6. **时间戳为整数微秒**：采集器不得以浮点数或依赖格式化器精度的形式写出时间戳；以 `double` 经 `llvm::raw_ostream` 默认格式输出会把长追踪量化到 1 ms 网格（`docs/measurement.md` 第 1.6 节）。
+7. **样本不丢弃、不双计**：每个完整事件只会计入一次 `self`（完整事件与父区间重叠的部分从父区间扣除）；未闭合区间与孤立结束事件必须计数并在控制台报告，不得静默丢弃。
 
 ---
 
 ## 8. 局限与演进方向
 
-- **验证器细粒度归因受限**：`outside` 指标目前提供 Pass 维度的验证与失效总和，无法进一步细分至具体的 Region 或 Operation。下钻细分需要修改上游 `mlir::verify` 内部实现。
-- **回归比对阈值整定**：当前 `--baseline` 采用固定比率（1.20 倍）与固定截断下限（200 µs），后续需支持基于实际测试环境噪声方差动态整定阈值。
+- **验证器细粒度归因受限**：`outside` 指标目前提供 Pass 维度的验证与失效总和，无法进一步细分至具体的 Region 或 Operation。下钻细分需要修改上游 `mlir::verify` 内部实现；多线程采集下该指标还包含线程等待，只有单线程采集才可读作验证开销（`docs/measurement.md` 第 1.4 节）。
+- **无关键路径视图**：当前只给出各线程的 `self` 累加与未覆盖区间，不计算关键路径延迟。
 - **并发分析模型演进**：后续计划分离“累计 CPU 消耗”与“关键路径（Critical Path）延迟”两种分析视图。
 - **上游生态跟踪**：若未来 MLIR 上游在 `Action::print()` 中原生补全 Operation 实例与源码位置信息，离线报告脚本可直接对接 `--profile-actions-to` 生成的数据流。
